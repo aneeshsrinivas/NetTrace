@@ -4,7 +4,10 @@ from datetime import datetime, timezone
 import hashlib
 import math
 
-from .packet_reader import read_packets, decode, CaptureFormatError
+try:
+    from .packet_reader import read_packets, decode, CaptureFormatError
+except ImportError:
+    from packet_reader import read_packets, decode, CaptureFormatError
 
 MAX_PACKETS = 100_000
 
@@ -121,7 +124,10 @@ def analyze(path, filename, rules=None):
         traffic = [{"timestamp": iso(start + i * width), "count": buckets[i]} for i in range(max(buckets) + 1)]
     # Run ML Intrusion Detection Classifier trained on benchmark datasets
     try:
-        from .ml_engine import classify_capture
+        try:
+            from .ml_engine import classify_capture
+        except ImportError:
+            from ml_engine import classify_capture
         ml_analysis = classify_capture(packets)
     except Exception as exc:
         ml_analysis = {
