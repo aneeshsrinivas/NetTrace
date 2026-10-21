@@ -13,14 +13,33 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
-from .analyzer import AnalysisError, analyze
-from .report import build_pdf
+try:
+    from .analyzer import AnalysisError, analyze
+    from .report import build_pdf
+    from .demo import controlled_capture, write_pcap
+    from .ml_engine import train_or_load_model
+except ImportError:
+    from analyzer import AnalysisError, analyze
+    from report import build_pdf
+    from demo import controlled_capture, write_pcap
+    from ml_engine import train_or_load_model
 
 MAX_BYTES = 50 * 1024 * 1024
 TIMEOUT = 120
-DB_PATH = Path(os.environ.get("NETTRACE_DB", Path(__file__).parent / "data" / "nettrace.sqlite3"))
-app = FastAPI(title="NetTrace local API")
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_methods=["GET", "POST"], allow_headers=["*", "Accept", "Content-Type"])
+
+if os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
+    DB_PATH = Path("/tmp/nettrace.sqlite3")
+else:
+    DB_PATH = Path(os.environ.get("NETTRACE_DB", Path(__file__).parent / "data" / "nettrace.sqlite3"))
+
+app = FastAPI(title="NetTrace API")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 def connect():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -39,14 +58,20 @@ def process_capture(path, filename, rules):
     with tempfile.NamedTemporaryFile(prefix="nettrace-result-", delete=False) as output:
         output_path = output.name
     try:
-        process = mp.get_context("spawn").Process(target=worker, args=(output_path, path, filename, rules))
-        process.start()
-        process.join(TIMEOUT)
-        if process.is_alive():
-            process.terminate(); process.join()
-            raise HTTPException(408, "Analysis exceeded the 120-second processing limit.")
         try:
+            process = mp.get_context("spawn").Process(target=worker, args=(output_path, path, filename, rules))
+            process.start()
+            process.join(TIMEOUT)
+            if process.is_alive():
+                process.terminate(); process.join()
+                raise HTTPException(408, "Analysis exceeded the 120-second processing limit.")
             result = json.loads(Path(output_path).read_text())
+        except (NotImplementedError, OSError, PermissionError):
+            # Serverless fallback when multiprocessing spawn is restricted
+            try:
+                result = {"success": True, "value": analyze(path, filename, rules)}
+            except Exception as exc:
+                result = {"success": False, "value": str(exc) if isinstance(exc, AnalysisError) else "The capture could not be processed."}
         except (OSError, ValueError):
             raise HTTPException(422, "Capture processing stopped unexpectedly.")
         if not result["success"]:
@@ -105,7 +130,6 @@ def upload(file: UploadFile = File(...), port_scan: bool = Form(True), syn_heavy
 
 @app.post("/api/demo", status_code=201)
 def demo():
-    from .demo import controlled_capture
     with tempfile.NamedTemporaryFile(prefix="nettrace-demo-", suffix=".pcap", delete=False) as temp:
         path = temp.name
     try:
@@ -117,7 +141,6 @@ def demo():
 @app.get("/api/ml/info")
 def ml_info():
     """Return trained Random Forest model provenance, benchmark dataset metrics, and feature importances."""
-    from .ml_engine import train_or_load_model
     _, metrics = train_or_load_model()
     return metrics
 
@@ -276,7 +299,6 @@ class CustomConditionRequest(BaseModel):
 @app.post("/api/simulate", status_code=201)
 def simulate_condition(req: CustomConditionRequest):
     """Dynamic Condition Simulator: Synthesizes arbitrary network conditions and inspects results."""
-    from .demo import write_pcap
     import ipaddress, struct, time
 
     flag_map = {
