@@ -1,0 +1,13 @@
+{
+  "name": "nettrace",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": ".venv\\Scripts\\streamlit run app.py",
+    "start": ".venv\\Scripts\\streamlit run app.py",
+    "test": ".venv\\Scripts\\pytest"
+  },
+  "dependencies": {
+    "concurrently": "^10.0.6"
+  }
+}
