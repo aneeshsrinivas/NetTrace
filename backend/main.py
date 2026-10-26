@@ -1,8 +1,7 @@
-"""Local API: uploaded captures are temporary; stored investigations contain metadata only."""
+import concurrent.futures
 import csv
 import io
 import json
-import multiprocessing as mp
 import os
 import sqlite3
 import tempfile
@@ -18,11 +17,13 @@ try:
     from .report import build_pdf
     from .demo import controlled_capture, write_pcap
     from .ml_engine import train_or_load_model
+    from .samples_generator import generate_preset_pcap
 except ImportError:
     from analyzer import AnalysisError, analyze
     from report import build_pdf
     from demo import controlled_capture, write_pcap
     from ml_engine import train_or_load_model
+    from samples_generator import generate_preset_pcap
 
 MAX_BYTES = 50 * 1024 * 1024
 TIMEOUT = 120
@@ -41,48 +42,52 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from contextlib import contextmanager
+
+@contextmanager
 def connect():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(DB_PATH)
-    db.execute("CREATE TABLE IF NOT EXISTS investigations (id TEXT PRIMARY KEY, filename TEXT NOT NULL, analyzed_at TEXT NOT NULL, sha256 TEXT NOT NULL, packet_count INTEGER NOT NULL, finding_count INTEGER NOT NULL, data TEXT NOT NULL)")
-    return db
-
-def worker(output_path, path, filename, rules):
     try:
-        result = {"success": True, "value": analyze(path, filename, rules)}
-    except Exception as exc:
-        result = {"success": False, "value": str(exc) if isinstance(exc, AnalysisError) else "The capture could not be processed."}
-    Path(output_path).write_text(json.dumps(result))
+        db.execute("CREATE TABLE IF NOT EXISTS investigations (id TEXT PRIMARY KEY, filename TEXT NOT NULL, analyzed_at TEXT NOT NULL, sha256 TEXT NOT NULL, packet_count INTEGER NOT NULL, finding_count INTEGER NOT NULL, data TEXT NOT NULL)")
+        yield db
+        db.commit()
+    finally:
+        db.close()
 
 def process_capture(path, filename, rules):
-    with tempfile.NamedTemporaryFile(prefix="nettrace-result-", delete=False) as output:
-        output_path = output.name
     try:
-        try:
-            process = mp.get_context("spawn").Process(target=worker, args=(output_path, path, filename, rules))
-            process.start()
-            process.join(TIMEOUT)
-            if process.is_alive():
-                process.terminate(); process.join()
-                raise HTTPException(408, "Analysis exceeded the 120-second processing limit.")
-            result = json.loads(Path(output_path).read_text())
-        except (NotImplementedError, OSError, PermissionError):
-            # Serverless fallback when multiprocessing spawn is restricted
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(analyze, path, filename, rules)
             try:
-                result = {"success": True, "value": analyze(path, filename, rules)}
+                value = future.result(timeout=TIMEOUT)
+            except concurrent.futures.TimeoutError:
+                raise HTTPException(408, "Analysis exceeded the 120-second processing limit.")
+            except AnalysisError as exc:
+                raise HTTPException(422, str(exc))
             except Exception as exc:
-                result = {"success": False, "value": str(exc) if isinstance(exc, AnalysisError) else "The capture could not be processed."}
-        except (OSError, ValueError):
-            raise HTTPException(422, "Capture processing stopped unexpectedly.")
-        if not result["success"]:
-            raise HTTPException(422, result["value"])
-        value = result["value"]
+                msg = str(exc) if isinstance(exc, AnalysisError) else "The capture could not be processed."
+                raise HTTPException(422, msg)
+        
         value["id"] = uuid.uuid4().hex
         with connect() as db:
-            db.execute("INSERT INTO investigations VALUES (?, ?, ?, ?, ?, ?, ?)", (value["id"], filename, value["analyzed_at"], value["sha256"], value["summary"]["packets_processed"], len(value["findings"]), json.dumps(value)))
+            db.execute(
+                "INSERT INTO investigations VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    value["id"],
+                    filename,
+                    value["analyzed_at"],
+                    value["sha256"],
+                    value["summary"]["packets_processed"],
+                    len(value["findings"]),
+                    json.dumps(value),
+                ),
+            )
         return value
-    finally:
-        Path(output_path).unlink(missing_ok=True)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(422, "Capture processing stopped unexpectedly.")
 
 def get_investigation(investigation_id):
     with connect() as db:
@@ -269,19 +274,24 @@ def run_test_preset(preset_id: str):
     if not preset:
         raise HTTPException(404, f"Preset '{preset_id}' not found.")
     
-    pcap_path = Path(__file__).parent.parent / "sample_pcaps" / preset["filename"]
-    if not pcap_path.exists():
-        # Auto-regenerate samples if not yet built
-        try:
-            import subprocess, sys
-            gen_script = Path(__file__).parent.parent / "scripts" / "generate_samples.py"
-            subprocess.run([sys.executable, str(gen_script)], check=True)
-        except Exception:
-            raise HTTPException(500, f"Sample capture file '{preset['filename']}' could not be located or generated.")
+    candidate_paths = [
+        Path(__file__).parent / "sample_pcaps" / preset["filename"],
+        Path(__file__).parent.parent / "sample_pcaps" / preset["filename"],
+    ]
+    pcap_path = next((p for p in candidate_paths if p.exists()), None)
+    if not pcap_path:
+        tmp_dir = Path(tempfile.gettempdir()) / "nettrace_sample_pcaps"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        pcap_path = tmp_dir / preset["filename"]
+        if not pcap_path.exists():
+            try:
+                generate_preset_pcap(preset["filename"], pcap_path)
+            except Exception as exc:
+                raise HTTPException(500, f"Sample capture file '{preset['filename']}' could not be located or generated: {exc}")
     
     return process_capture(str(pcap_path), preset["filename"], {"port_scan": True, "syn_heavy": True, "repeated": True})
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 class CustomConditionRequest(BaseModel):
     source_ip: str = Field("192.168.1.188", description="Source IP address")
@@ -296,10 +306,42 @@ class CustomConditionRequest(BaseModel):
     protocol: str = Field("TCP", description="TCP, UDP, ICMP")
     packet_size: int = Field(64, ge=54, le=1500)
 
+    @field_validator("source_ip", "target_ip")
+    @classmethod
+    def validate_ip_address(cls, v: str) -> str:
+        cleaned = v.strip()
+        if not cleaned:
+            raise ValueError("IP address cannot be empty.")
+        import ipaddress
+        try:
+            ipaddress.ip_address(cleaned)
+        except ValueError:
+            raise ValueError(f"'{v}' is not a valid IPv4 or IPv6 address.")
+        return cleaned
+
+    @field_validator("ports")
+    @classmethod
+    def validate_ports_list(cls, v: list[int]) -> list[int]:
+        if not v:
+            return [80]
+        for p in v:
+            if not (0 <= p <= 65535):
+                raise ValueError(f"Port {p} is out of valid range (0-65535).")
+        return v
+
 @app.post("/api/simulate", status_code=201)
 def simulate_condition(req: CustomConditionRequest):
     """Dynamic Condition Simulator: Synthesizes arbitrary network conditions and inspects results."""
     import ipaddress, struct, time
+
+    try:
+        src_ip_obj = ipaddress.ip_address(req.source_ip.strip())
+        dst_ip_obj = ipaddress.ip_address(req.target_ip.strip())
+    except ValueError as exc:
+        raise HTTPException(422, f"Invalid IP address format: {exc}")
+
+    if src_ip_obj.version != 4 or dst_ip_obj.version != 4:
+        raise HTTPException(422, "The condition synthesizer currently supports IPv4 addresses for synthetic traffic.")
 
     flag_map = {
         "SYN": 0x02,

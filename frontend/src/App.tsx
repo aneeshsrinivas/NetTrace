@@ -521,12 +521,31 @@ export default function App() {
     }
   };
 
+  const isValidIpv4 = (ip: string) => {
+    const parts = ip.trim().split('.');
+    if (parts.length !== 4) return false;
+    return parts.every(part => {
+      if (!/^\d+$/.test(part)) return false;
+      const num = parseInt(part, 10);
+      return num >= 0 && num <= 255 && String(num) === part;
+    });
+  };
+
   const runPreset = async (presetId: string) => {
     setBusy(true);
     setError('');
     try {
       const r = await fetch(`${endpoint}/test-presets/${presetId}/run`, { method: 'POST' });
-      if (!r.ok) throw Error('Could not execute test preset.');
+      if (!r.ok) {
+        let message = 'Could not execute test preset.';
+        try {
+          const errData = await r.json();
+          if (errData.detail) {
+            message = typeof errData.detail === 'string' ? errData.detail : JSON.stringify(errData.detail);
+          }
+        } catch {}
+        throw Error(message);
+      }
       const data: Investigation = await r.json();
       setCurrent(data);
       setSelectedFinding(null);
@@ -551,17 +570,38 @@ export default function App() {
   };
 
   const runSimulation = async () => {
-    setBusy(true);
     setError('');
-    try {
-      const parsedPorts = simPorts
-        .split(',')
-        .map(p => parseInt(p.trim(), 10))
-        .filter(p => !isNaN(p) && p > 0 && p <= 65535);
+    const src = simSrc.trim();
+    const dst = simDst.trim();
+    if (!src || !isValidIpv4(src)) {
+      setError(`Invalid Source Host IP '${simSrc}'. Please provide a valid IPv4 address (e.g. 192.168.1.188).`);
+      return;
+    }
+    if (!dst || !isValidIpv4(dst)) {
+      setError(`Invalid Target Host IP '${simDst}'. Please provide a valid IPv4 address (e.g. 192.168.1.1).`);
+      return;
+    }
 
+    const rawPortList = simPorts.split(',').map(s => s.trim()).filter(Boolean);
+    const parsedPorts: number[] = [];
+    for (const pStr of rawPortList) {
+      if (!/^\d+$/.test(pStr)) {
+        setError(`Invalid port value '${pStr}'. Destination ports must be integers between 1 and 65535.`);
+        return;
+      }
+      const p = parseInt(pStr, 10);
+      if (p < 1 || p > 65535) {
+        setError(`Port '${p}' is outside the valid range 1-65535.`);
+        return;
+      }
+      parsedPorts.push(p);
+    }
+
+    setBusy(true);
+    try {
       const payload = {
-        source_ip: simSrc.trim() || '192.168.1.188',
-        target_ip: simDst.trim() || '192.168.1.1',
+        source_ip: src,
+        target_ip: dst,
         condition_name: `Simulated ${simScenario.toUpperCase()}`,
         scenario_type: simScenario,
         packet_count: simCount,
@@ -580,7 +620,12 @@ export default function App() {
       });
       if (!r.ok) {
         let msg = 'Condition simulation failed.';
-        try { msg = (await r.json()).detail || msg; } catch {}
+        try {
+          const errData = await r.json();
+          if (errData.detail) {
+            msg = typeof errData.detail === 'string' ? errData.detail : JSON.stringify(errData.detail);
+          }
+        } catch {}
         throw Error(msg);
       }
       const data: Investigation = await r.json();
@@ -827,8 +872,8 @@ export default function App() {
                     </div>
                     <div className="hero-stat-card">
                       <ShieldCheck size={22} color="#4ade80" />
-                      <strong>Zero Egress</strong>
-                      <span>100% Private Offline</span>
+                      <strong>Private Forensics</strong>
+                      <span>Zero Raw Retention</span>
                     </div>
                   </div>
 
@@ -1039,21 +1084,27 @@ export default function App() {
 
                         <div className="input-group">
                           <div>
-                            <label className="field-label">Source Host IP</label>
+                            <label htmlFor="sim-src-ip" className="field-label">Source Host IP</label>
                             <input
+                              id="sim-src-ip"
                               className="text-input"
                               value={simSrc}
                               onChange={e => setSimSrc(e.target.value)}
                               placeholder="192.168.1.188"
+                              aria-label="Source Host IP"
+                              aria-required="true"
                             />
                           </div>
                           <div>
-                            <label className="field-label">Target Host IP</label>
+                            <label htmlFor="sim-dst-ip" className="field-label">Target Host IP</label>
                             <input
+                              id="sim-dst-ip"
                               className="text-input"
                               value={simDst}
                               onChange={e => setSimDst(e.target.value)}
                               placeholder="192.168.1.1"
+                              aria-label="Target Host IP"
+                              aria-required="true"
                             />
                           </div>
                         </div>
@@ -1062,11 +1113,13 @@ export default function App() {
                       {/* Column 2: Traffic Characteristics */}
                       <div className="builder-col">
                         <div className="field-row">
-                          <label className="field-label">Protocol</label>
-                          <div className="radio-pill-group">
+                          <span id="sim-proto-label" className="field-label">Protocol</span>
+                          <div className="radio-pill-group" role="radiogroup" aria-labelledby="sim-proto-label">
                             {(['TCP', 'UDP', 'ICMP'] as const).map(pr => (
                               <button
                                 key={pr}
+                                role="radio"
+                                aria-checked={simProto === pr}
                                 className={`pill-btn ${simProto === pr ? 'active' : ''}`}
                                 onClick={() => setSimProto(pr)}
                               >
@@ -1077,22 +1130,26 @@ export default function App() {
                         </div>
 
                         <div className="field-row">
-                          <label className="field-label">Destination Ports (comma-separated)</label>
+                          <label htmlFor="sim-dest-ports" className="field-label">Destination Ports (comma-separated)</label>
                           <input
+                            id="sim-dest-ports"
                             className="text-input"
                             value={simPorts}
                             onChange={e => setSimPorts(e.target.value)}
                             placeholder="e.g. 22, 80, 443"
+                            aria-label="Destination Ports"
                           />
                         </div>
 
                         {simProto === 'TCP' && (
                           <div className="field-row">
-                            <label className="field-label">Initial TCP Flags</label>
+                            <label htmlFor="sim-tcp-flags" className="field-label">Initial TCP Flags</label>
                             <select
+                              id="sim-tcp-flags"
                               className="select-input"
                               value={simFlag}
                               onChange={e => setSimFlag(e.target.value)}
+                              aria-label="Initial TCP Flags"
                             >
                               <option value="SYN">SYN (0x02) - Connection Request</option>
                               <option value="ACK">ACK (0x10) - Established ACK</option>
@@ -1106,41 +1163,53 @@ export default function App() {
                         )}
 
                         <div className="slider-row">
-                          <div className="slider-label">
+                          <label htmlFor="sim-packet-volume" className="slider-label">
                             <span>Packet Volume: <b>{simCount} packets</b></span>
-                          </div>
+                          </label>
                           <input
+                            id="sim-packet-volume"
                             type="range"
-                            min="6"
+                            min="4"
                             max="300"
-                            step="2"
+                            step="1"
                             value={simCount}
                             onChange={e => setSimCount(parseInt(e.target.value, 10))}
                             className="slider"
+                            aria-label="Packet Volume"
+                            aria-valuemin={4}
+                            aria-valuemax={300}
+                            aria-valuenow={simCount}
+                            aria-valuetext={`${simCount} packets`}
                           />
                         </div>
 
                         <div className="slider-row">
-                          <div className="slider-label">
+                          <label htmlFor="sim-packet-size" className="slider-label">
                             <span>Packet Payload Size: <b>{simPacketSize} Bytes</b></span>
-                          </div>
+                          </label>
                           <input
+                            id="sim-packet-size"
                             type="range"
                             min="54"
                             max="1500"
-                            step="10"
+                            step="1"
                             value={simPacketSize}
                             onChange={e => setSimPacketSize(parseInt(e.target.value, 10))}
                             className="slider"
+                            aria-label="Packet Payload Size"
+                            aria-valuemin={54}
+                            aria-valuemax={1500}
+                            aria-valuenow={simPacketSize}
+                            aria-valuetext={`${simPacketSize} bytes`}
                           />
                         </div>
 
-
                         <div className="slider-row">
-                          <div className="slider-label">
+                          <label htmlFor="sim-response-rate" className="slider-label">
                             <span>Target Response Rate: <b>{Math.round(simRespRatio * 100)}%</b></span>
-                          </div>
+                          </label>
                           <input
+                            id="sim-response-rate"
                             type="range"
                             min="0"
                             max="1"
@@ -1148,21 +1217,32 @@ export default function App() {
                             value={simRespRatio}
                             onChange={e => setSimRespRatio(parseFloat(e.target.value))}
                             className="slider"
+                            aria-label="Target Response Rate"
+                            aria-valuemin={0}
+                            aria-valuemax={100}
+                            aria-valuenow={Math.round(simRespRatio * 100)}
+                            aria-valuetext={`${Math.round(simRespRatio * 100)} percent`}
                           />
                         </div>
 
                         <div className="slider-row">
-                          <div className="slider-label">
+                          <label htmlFor="sim-duration-span" className="slider-label">
                             <span>Duration Span: <b>{simDuration.toFixed(1)}s</b></span>
-                          </div>
+                          </label>
                           <input
+                            id="sim-duration-span"
                             type="range"
-                            min="0.2"
+                            min="0.1"
                             max="60"
-                            step="0.5"
+                            step="0.1"
                             value={simDuration}
                             onChange={e => setSimDuration(parseFloat(e.target.value))}
                             className="slider"
+                            aria-label="Duration Span"
+                            aria-valuemin={0.1}
+                            aria-valuemax={60}
+                            aria-valuenow={simDuration}
+                            aria-valuetext={`${simDuration.toFixed(1)} seconds`}
                           />
                         </div>
 
@@ -1194,7 +1274,7 @@ export default function App() {
                 <h1>Start with <em>the capture.</em></h1>
                 <p>
                   Upload a packet capture to build an evidence-linked view of its traffic.
-                  Heuristic analysis and ML threat inference run entirely on this computer.
+                  Captured frames are processed in ephemeral memory for metadata extraction with zero raw payload retention.
                 </p>
               </div>
 
@@ -1221,7 +1301,13 @@ export default function App() {
                       <>
                         <div className="upload-icon"><FileText size={27} /></div>
                         <h3>{file.name}</h3>
-                        <p>{size(file.size)} · {file.name.toLowerCase().endsWith('.pcapng') ? 'PCAPNG' : 'PCAP'} capture</p>
+                        <p>{size(file.size)} · {
+                          file.name.toLowerCase().endsWith('.pcapng')
+                            ? 'PCAPNG capture'
+                            : file.name.toLowerCase().endsWith('.pcap')
+                            ? 'PCAP capture'
+                            : 'Unsupported file format'
+                        }</p>
                         <div className="selected-actions">
                           <button className="text-link" onClick={() => input.current?.click()}>Replace file</button>
                           <button
@@ -2145,7 +2231,7 @@ export default function App() {
                 <div className="eyebrow"><span className="eyebrow-line" /> ABOUT / METHODOLOGY</div>
                 <h1>Follow the data.<br /><em>Know the limits.</em></h1>
                 <p>
-                  NetTrace provides transparent offline forensics. It blends explainable TCP heuristics
+                  NetTrace provides transparent network traffic forensics. It blends explainable TCP heuristics
                   with machine learning flow vector classifications to provide actionable visibility without external dependencies.
                 </p>
               </div>
@@ -2211,7 +2297,7 @@ export default function App() {
                     <li>Capture loss, asymmetric routing, and payload encryption naturally limit network-level analysis.</li>
                     <li>IPv4 and IPv6 headers are read where available; unsupported frames may not yield IP records.</li>
                     <li>A SHA-256 hash identifies byte integrity, but does not prove source authenticity.</li>
-                    <li>NetTrace is an offline investigation tool; it does not block traffic or perform live packet capture.</li>
+                    <li>NetTrace is a post-capture investigation tool; it processes captures in ephemeral memory and does not block traffic or perform live packet capture.</li>
                   </ul>
                   <div className="stack-label">
                     ENGINE STACK <span>React · TypeScript · Vite · FastAPI · Scikit-Learn · SQLite · ReportLab</span>
@@ -2224,7 +2310,7 @@ export default function App() {
 
         <footer className="footer">
           <span>NETTRACE FORENSICS WORKSPACE / KNOW YOUR NETWORK. FOLLOW THE EVIDENCE.</span>
-          <span>100% OFFLINE LOCAL INVESTIGATION <ArrowUpRight size={14} /></span>
+          <span>ZERO RAW RETENTION · METADATA-ONLY ARCHIVE <ArrowUpRight size={14} /></span>
         </footer>
       </div>
     </div>
