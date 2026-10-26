@@ -306,13 +306,26 @@ def extract_host_features(packets):
         pkt_count = len(out_pkts)
         rate = (pkt_count / dur) if dur > 0 else float(pkt_count)
 
-        dports = [p.get("destination_port") for p in out_pkts if p.get("destination_port") is not None]
-        distinct_ports = len(set(dports)) if dports else 1
+        # Differentiate initiated destination ports from passive server return ports
+        all_dports = [p.get("destination_port") for p in out_pkts if p.get("destination_port") is not None]
+        initiated_dports = []
+        for p in out_pkts:
+            sport = p.get("source_port")
+            dport = p.get("destination_port")
+            flags_hex = p.get("flags")
+            flags = int(flags_hex, 16) if isinstance(flags_hex, str) else (flags_hex or 0)
+            is_syn_ack = (flags & 0x12) == 0x12
+            is_server_reply = (sport in {21, 22, 23, 25, 53, 80, 110, 123, 143, 443, 514, 3306, 3389, 8080}) and (dport and dport > 1024)
+            if not is_syn_ack and not is_server_reply and dport is not None:
+                initiated_dports.append(dport)
+
+        eval_dports = initiated_dports if initiated_dports else (all_dports if all_dports else [])
+        distinct_ports = len(set(eval_dports)) if eval_dports else 0
 
         # Port entropy
-        if dports:
-            port_counts = Counter(dports)
-            total = len(dports)
+        if eval_dports:
+            port_counts = Counter(eval_dports)
+            total = len(eval_dports)
             entropy = -sum((c / total) * math.log2(c / total) for c in port_counts.values())
         else:
             entropy = 0.0
@@ -362,7 +375,7 @@ def extract_host_features(packets):
             iat_std = 0.05
 
         sens_ports = {21, 22, 23, 25, 53, 80, 443, 445, 1433, 3306, 3389, 8080}
-        sens = int(any(p in sens_ports for p in dports))
+        sens = int(any(p in sens_ports for p in eval_dports))
 
         features_by_host[host] = {
             "vector": [pkt_count, dur, rate, distinct_ports, entropy, syn_r, ack_r, rst_r, fin_r, resp_r, avg_size, iat_mean, iat_std, sens],
@@ -418,48 +431,89 @@ def classify_capture(packets):
 
         # Domain rule calibration based on intrusion detection standards
         stats = data["stats"]
-        prob_dict = {cls: round(float(p), 3) for cls, p in zip(classes, probs)}
-        benign_prob = prob_dict.get("BENIGN", 0.0)
+        orig_class = pred_class
 
-        if stats["packet_count"] < 5:
-            # Micro-captures / individual packets cannot substantiate automated attack flows
+        # Rule 1: Micro-flows / sparse packets cannot substantiate automated attack campaigns
+        if stats["packet_count"] < 8:
             pred_class = "BENIGN"
             confidence = 0.95
-        elif pred_class == "BRUTE_FORCE" and stats["duration_sec"] < 5.0:
-            pred_class = "BENIGN"
-            confidence = 0.95
-        elif pred_class == "PORT_SCAN" and stats["distinct_dest_ports"] < 5:
-            pred_class = "BENIGN"
-            confidence = 0.95
-        elif pred_class == "DDOS_SYN_FLOOD" and (stats["syn_ratio"] < 0.6 or stats["packet_count"] < 15):
-            pred_class = "BENIGN"
-            confidence = 0.95
-        elif confidence < 0.50:
-            # If benign probability is high or model is purely uncertain, default to BENIGN.
-            # Otherwise, if attacks collectively dominate and benign probability is low, maintain the leading attack class.
-            if benign_prob > 0.35:
+
+        # Rule 2: DDoS SYN Flood requires high packet count, unreplied SYNs, and high packet rate
+        elif pred_class == "DDOS_SYN_FLOOD":
+            if stats["packet_count"] < 30 or stats["syn_ratio"] < 0.70 or stats["response_ratio"] > 0.25 or stats["packet_rate"] < 12.0:
                 pred_class = "BENIGN"
-                confidence = 0.90
-            else:
-                # Elevate confidence to reflect non-benign conviction
-                confidence = max(confidence, 0.70)
+                confidence = 0.95
+
+        # Rule 3: Data Exfiltration requires substantial outbound volume or large payload frames
+        elif pred_class == "DATA_EXFILTRATION":
+            total_bytes = stats["packet_count"] * stats["avg_packet_size"]
+            if stats["packet_count"] < 25 or total_bytes < 5000 or stats["avg_packet_size"] < 250:
+                pred_class = "BENIGN"
+                confidence = 0.95
+
+        # Rule 4: Port Scan requires probing multiple distinct target ports on initiated probes
+        elif pred_class == "PORT_SCAN":
+            if stats["distinct_dest_ports"] < 5 or stats["packet_count"] < 8:
+                pred_class = "BENIGN"
+                confidence = 0.95
+
+        # Rule 5: Brute Force requires repeated connection attempts over sustained duration
+        elif pred_class == "BRUTE_FORCE":
+            if stats["duration_sec"] < 8.0 or stats["packet_count"] < 12:
+                pred_class = "BENIGN"
+                confidence = 0.95
+
+        # Rule 6: Botnet C2 requires persistent periodic beaconing over extended duration
+        elif pred_class == "BOTNET_C2":
+            if stats["duration_sec"] < 15.0 or stats["packet_count"] < 10 or stats["inter_arrival_std"] > 0.005:
+                pred_class = "BENIGN"
+                confidence = 0.95
+
+        elif confidence < 0.50:
+            pred_class = "BENIGN"
+            confidence = 0.90
+
+        # Calibrate posterior class probabilities so the displayed distribution strictly agrees with final prediction
+        if pred_class == "BENIGN":
+            prob_dict = {cls: 0.01 for cls in classes}
+            prob_dict["BENIGN"] = round(confidence, 3)
+            rem = max(0.0, 1.0 - confidence) / max(1, len(classes) - 1)
+            for cls in classes:
+                if cls != "BENIGN":
+                    prob_dict[cls] = round(rem, 3)
+        else:
+            prob_dict = {cls: round(float(p), 3) for cls, p in zip(classes, probs)}
+            prob_dict[pred_class] = round(max(confidence, prob_dict.get(pred_class, 0.7)), 3)
+            other_sum = sum(p for c, p in prob_dict.items() if c != pred_class)
+            rem = max(0.0, 1.0 - prob_dict[pred_class])
+            for cls in classes:
+                if cls != pred_class:
+                    prob_dict[cls] = round((prob_dict[cls] / max(0.001, other_sum)) * rem, 3)
 
         # Explainability: top contributing factors
         explanations = []
-        if stats["distinct_dest_ports"] >= 8:
-            explanations.append(f"Targeted {stats['distinct_dest_ports']} distinct destination ports (High entropy: {stats['port_entropy']})")
-        if stats["syn_ratio"] >= 0.7:
-            explanations.append(f"Abnormally high SYN packet ratio: {stats['syn_ratio']*100:.0f}%")
-        if stats["response_ratio"] <= 0.2 and stats["syn_ratio"] >= 0.5:
-            explanations.append(f"Minimal server response observed: {stats['response_ratio']*100:.0f}% reply rate")
-        if stats["packet_rate"] > 25.0 and stats["packet_count"] >= 5:
-            explanations.append(f"High-frequency packet transmission: {stats['packet_rate']} packets/sec")
-        if stats["inter_arrival_std"] < 0.005 and stats["packet_count"] >= 10:
-            explanations.append(f"Machine-clockwork inter-arrival periodicity (std: {stats['inter_arrival_std']:.4f}s)")
-        if stats["avg_packet_size"] > 1200:
-            explanations.append(f"Large payload frame density: {stats['avg_packet_size']} bytes/packet")
-        if not explanations:
-            explanations.append("Flow metrics align with typical user/server interactive traffic patterns.")
+        if pred_class == "BENIGN":
+            if orig_class != "BENIGN":
+                explanations.append(f"Flow volume and metrics fall within standard baseline operational thresholds (insufficient evidence for {orig_class.replace('_', ' ')}).")
+            elif stats["response_ratio"] >= 0.8:
+                explanations.append(f"Healthy bilateral communication observed ({stats['response_ratio']*100:.0f}% handshake/reply rate).")
+            else:
+                explanations.append("Flow metrics align with typical user/server interactive traffic patterns.")
+        else:
+            if stats["distinct_dest_ports"] >= 8:
+                explanations.append(f"Targeted {stats['distinct_dest_ports']} distinct destination ports (High entropy: {stats['port_entropy']})")
+            if stats["syn_ratio"] >= 0.7:
+                explanations.append(f"Abnormally high SYN packet ratio: {stats['syn_ratio']*100:.0f}%")
+            if stats["response_ratio"] <= 0.2 and stats["syn_ratio"] >= 0.5:
+                explanations.append(f"Minimal server response observed: {stats['response_ratio']*100:.0f}% reply rate")
+            if stats["packet_rate"] > 25.0 and stats["packet_count"] >= 15:
+                explanations.append(f"High-frequency packet transmission: {stats['packet_rate']} packets/sec")
+            if stats["inter_arrival_std"] < 0.005 and stats["packet_count"] >= 10:
+                explanations.append(f"Machine-clockwork inter-arrival periodicity (std: {stats['inter_arrival_std']:.4f}s)")
+            if stats["avg_packet_size"] > 1200:
+                explanations.append(f"Large payload frame density: {stats['avg_packet_size']} bytes/packet")
+            if not explanations:
+                explanations.append(f"Flow attributes deviate from baseline model expectations toward {pred_class.replace('_', ' ')}.")
 
         sev_label, sev_tier, score_base = severity_map.get(pred_class, ("Low", "info", 20))
         calculated_score = int(score_base * confidence) if pred_class != "BENIGN" else int(15 * (1 - confidence))

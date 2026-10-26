@@ -673,12 +673,21 @@ export default function App() {
     setError('');
     const src = simSrc.trim();
     const dst = simDst.trim();
+    const isIpv6 = (ip: string) => ip.includes(':');
+    if (isIpv6(src)) {
+      setError(`IPv6 address detected ('${simSrc}'). The custom condition synthesizer currently generates IPv4 test frames. Enter an IPv4 address (e.g. 192.168.1.188) or run Preset 06 for native IPv6 traffic analysis.`);
+      return;
+    }
     if (!src || !isValidIpv4(src)) {
-      setError(`Invalid Source Host IP '${simSrc}'. Please provide a valid IPv4 address (e.g. 192.168.1.188).`);
+      setError(`Invalid Source Host IPv4 Address '${simSrc}'. Enter a valid IPv4 address (e.g. 192.168.1.188).`);
+      return;
+    }
+    if (isIpv6(dst)) {
+      setError(`IPv6 address detected ('${simDst}'). The custom condition synthesizer currently generates IPv4 test frames. Enter an IPv4 address (e.g. 192.168.1.1) or run Preset 06 for native IPv6 traffic analysis.`);
       return;
     }
     if (!dst || !isValidIpv4(dst)) {
-      setError(`Invalid Target Host IP '${simDst}'. Please provide a valid IPv4 address (e.g. 192.168.1.1).`);
+      setError(`Invalid Target Host IPv4 Address '${simDst}'. Enter a valid IPv4 address (e.g. 192.168.1.1).`);
       return;
     }
 
@@ -1202,28 +1211,30 @@ export default function App() {
 
                         <div className="input-group">
                           <div>
-                            <label htmlFor="sim-src-ip" className="field-label">Source Host IP</label>
+                            <label htmlFor="sim-src-ip" className="field-label">Source Host IPv4 Address</label>
                             <input
                               id="sim-src-ip"
                               className="text-input"
                               value={simSrc}
                               onChange={e => setSimSrc(e.target.value)}
                               placeholder="192.168.1.188"
-                              aria-label="Source Host IP"
+                              aria-label="Source Host IPv4 Address"
                               aria-required="true"
                             />
+                            <small style={{ color: 'var(--text-dim)', fontSize: '0.78rem' }}>Custom synthesis generates synthetic IPv4 packets</small>
                           </div>
                           <div>
-                            <label htmlFor="sim-dst-ip" className="field-label">Target Host IP</label>
+                            <label htmlFor="sim-dst-ip" className="field-label">Target Host IPv4 Address</label>
                             <input
                               id="sim-dst-ip"
                               className="text-input"
                               value={simDst}
                               onChange={e => setSimDst(e.target.value)}
                               placeholder="192.168.1.1"
-                              aria-label="Target Host IP"
+                              aria-label="Target Host IPv4 Address"
                               aria-required="true"
                             />
+                            <small style={{ color: 'var(--text-dim)', fontSize: '0.78rem' }}>For IPv6 captures, see Preset 06 (IPv6 Recon)</small>
                           </div>
                         </div>
                       </div>
@@ -1387,12 +1398,12 @@ export default function App() {
             <section className="upload-page">
               <div className="page-intro">
                 <div className="eyebrow">
-                  <span className="eyebrow-line" /> LOCAL PCAP INGESTION / 01
+                  <span className="eyebrow-line" /> PCAP / PCAPNG INGESTION & FORENSICS / 01
                 </div>
                 <h1>Start with <em>the capture.</em></h1>
                 <p>
-                  Upload a packet capture to build an evidence-linked view of its traffic.
-                  Captured frames are processed in ephemeral memory for metadata extraction with zero raw payload retention.
+                  Upload a packet capture to extract flow metrics, heuristic evidence, and ML behavioral classifications.
+                  Captures are transmitted securely over HTTPS, analyzed in volatile container memory, and immediately unlinked with zero raw payload retention.
                 </p>
               </div>
 
@@ -1517,7 +1528,7 @@ export default function App() {
                   <div className="page-intro compact">
                     <div className="eyebrow"><span className="eyebrow-line" /> INVESTIGATION ARCHIVE</div>
                     <h1>Past <em>captures.</em></h1>
-                    <p>Reopen a local analysis or start with a new capture.</p>
+                    <p>Reopen recent investigations from your persistent browser forensic session cache or ephemeral backend state.</p>
                   </div>
                   <div className="section-heading archive-heading">
                     <h2>Saved investigations</h2>

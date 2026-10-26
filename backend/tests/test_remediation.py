@@ -219,3 +219,84 @@ def test_sync_investigation_endpoint(client):
     ids = [item['id'] for item in list_resp.json()]
     assert fake_id in ids
 
+def test_reg01_clean_interactive_web_simulation_is_benign(client):
+    """REG-01: Clean Interactive Web archetype (15 probes, 15 replies) must be classified as BENIGN with 0 threat score."""
+    payload = {
+        "source_ip": "192.168.1.188",
+        "target_ip": "192.168.1.1",
+        "condition_name": "Clean Interactive Web",
+        "scenario_type": "benign",
+        "packet_count": 15,
+        "ports": [80, 443, 53],
+        "tcp_flags": "SYN",
+        "response_ratio": 1.0,
+        "duration_seconds": 2.0,
+        "protocol": "TCP",
+        "packet_size": 64
+    }
+    resp = client.post('/api/simulate', json=payload)
+    assert resp.status_code == 201
+    data = resp.json()
+    assert data['summary']['packets_processed'] == 30
+    assert data['summary']['findings'] == 0
+    assert data['summary']['threat_score'] == 0
+    assert "BENIGN" in data['summary']['overall_severity']
+
+    classifications = data['ml_analysis']['classifications']
+    for host_c in classifications:
+        assert host_c['prediction'] == "BENIGN"
+        assert host_c['threat_score'] == 0
+        assert host_c['confidence'] >= 0.90
+        assert host_c['probabilities']['BENIGN'] == host_c['confidence']
+
+def test_reg02_protocol_mix_preset_is_benign(client):
+    """REG-02: Protocol Mix preset (12 packets, diagnostic traffic) must be classified as BENIGN with 0 threat score."""
+    resp = client.post('/api/test-presets/07_mixed_proto/run')
+    assert resp.status_code == 201
+    data = resp.json()
+    assert data['summary']['packets_processed'] == 12
+    assert data['summary']['findings'] == 0
+    assert data['summary']['threat_score'] == 0
+    assert "BENIGN" in data['summary']['overall_severity']
+
+    for host_c in data['ml_analysis']['classifications']:
+        assert host_c['prediction'] == "BENIGN"
+        assert host_c['threat_score'] == 0
+
+def test_reg03_confidence_and_probability_consistency(client):
+    """REG-03: Class probabilities must sum to ~1.0 and highest probability must equal reported confidence."""
+    pcap_bytes = make_one_syn_pcap()
+    resp = client.post('/api/investigations', files={'file': ('single.pcap', pcap_bytes, 'application/octet-stream')})
+    assert resp.status_code == 201
+    data = resp.json()
+
+    for host_c in data['ml_analysis']['classifications']:
+        pred = host_c['prediction']
+        conf = host_c['confidence']
+        probs = host_c['probabilities']
+        # Highest probability must equal reported confidence
+        assert probs[pred] == conf
+        # Total probability distribution must sum to approximately 1.0
+        total_p = sum(probs.values())
+        assert abs(total_p - 1.0) < 0.05
+
+def test_reg06_custom_simulator_ipv6_validation(client):
+    """REG-06: Custom condition simulator must reject IPv6 addresses with a clear explanatory error."""
+    payload = {
+        "source_ip": "2001:db8::1",
+        "target_ip": "192.168.1.1",
+        "condition_name": "IPv6 Test",
+        "scenario_type": "custom",
+        "packet_count": 10,
+        "ports": [80],
+        "tcp_flags": "SYN",
+        "response_ratio": 0.0,
+        "duration_seconds": 2.0,
+        "protocol": "TCP",
+        "packet_size": 64
+    }
+    resp = client.post('/api/simulate', json=payload)
+    assert resp.status_code == 422
+    assert "currently supports IPv4" in resp.text
+
+
