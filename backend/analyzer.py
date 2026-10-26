@@ -143,6 +143,23 @@ def analyze(path, filename, rules=None):
     for row in packets:
         row.pop("time_value", None)
 
+    # Reconcile heuristic findings with ML analysis to prevent conflicting security conclusions
+    finding_count = len(findings)
+    threat_score = ml_analysis["overall_threat_score"]
+    overall_severity = ml_analysis["overall_severity"]
+
+    if finding_count > 0:
+        if finding_count >= 3:
+            threat_score = max(threat_score, 88 if finding_count >= 4 else 75)
+            overall_severity = "CRITICAL" if threat_score >= 85 else "HIGH"
+        elif finding_count >= 1:
+            threat_score = max(threat_score, 60)
+            if overall_severity in ("BENIGN", "BENIGN / LOW", "LOW"):
+                overall_severity = "HIGH" if threat_score >= 60 else "MEDIUM"
+
+    ml_analysis["overall_threat_score"] = threat_score
+    ml_analysis["overall_severity"] = overall_severity
+
     summary_data = {
         "packets_processed": index if 'index' in locals() else 0,
         "ip_packets": len(packets),
@@ -150,9 +167,9 @@ def analyze(path, filename, rules=None):
         "distinct_ports": len(ports),
         "duration_seconds": round(max(times) - min(times), 3) if times else None,
         "protocols": dict(protocols),
-        "findings": len(findings),
-        "threat_score": ml_analysis["overall_threat_score"],
-        "overall_severity": ml_analysis["overall_severity"]
+        "findings": finding_count,
+        "threat_score": threat_score,
+        "overall_severity": overall_severity
     }
 
     return {

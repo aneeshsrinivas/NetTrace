@@ -370,10 +370,70 @@ function MiniBars({ points }: { points: { count: number }[] }) {
   );
 }
 
+const STORAGE_HISTORY_KEY = 'nettrace_archive_history_v1';
+const STORAGE_INV_PREFIX = 'nettrace_inv_v1_';
+
+function saveInvestigationToStorage(inv: Investigation) {
+  try {
+    localStorage.setItem(STORAGE_INV_PREFIX + inv.id, JSON.stringify(inv));
+  } catch (e) {
+    console.warn('Failed to save investigation to localStorage', e);
+  }
+}
+
+function getInvestigationFromStorage(id: string): Investigation | null {
+  try {
+    const raw = localStorage.getItem(STORAGE_INV_PREFIX + id);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveHistoryToStorage(historyList: History[]) {
+  try {
+    localStorage.setItem(STORAGE_HISTORY_KEY, JSON.stringify(historyList.slice(0, 100)));
+  } catch (e) {
+    console.warn('Failed to save history to localStorage', e);
+  }
+}
+
+function getHistoryFromStorage(): History[] {
+  try {
+    const raw = localStorage.getItem(STORAGE_HISTORY_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+function generateCsvClientSide(inv: Investigation) {
+  const headers = ['Index', 'Timestamp', 'Source IP', 'Source Port', 'Destination IP', 'Destination Port', 'Protocol', 'Length', 'Flags'];
+  const rows = inv.packets.map(p => [
+    p.index,
+    p.timestamp || '',
+    p.source,
+    p.source_port ?? '',
+    p.destination,
+    p.destination_port ?? '',
+    p.protocol,
+    p.length,
+    p.flags || ''
+  ]);
+  const csvContent = [headers.join(','), ...rows.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(','))].join('\n');
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `nettrace-${inv.id.slice(0, 8)}-packets.csv`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
 export default function App() {
   const [page, setPage] = useState<Page>('overview');
   const [tab, setTab] = useState<Tab>('summary');
-  const [history, setHistory] = useState<History[]>([]);
+  const [history, setHistory] = useState<History[]>(() => getHistoryFromStorage());
   const [current, setCurrent] = useState<Investigation | null>(null);
   const [file, setFile] = useState<File | null>(null);
   const [drag, setDrag] = useState(false);
@@ -417,9 +477,20 @@ export default function App() {
 
   useEffect(() => {
     fetch(`${endpoint}/investigations`)
-      .then(r => r.ok ? r.json() : Promise.reject())
-      .then(setHistory)
-      .catch(() => setError('Could not connect to the local API. Ensure python server is running on port 8000.'));
+      .then(r => r.ok ? r.json() : [])
+      .then((serverHistory: History[]) => {
+        setHistory(prev => {
+          const map = new Map<string, History>();
+          serverHistory.forEach(item => map.set(item.id, item));
+          prev.forEach(item => map.set(item.id, item));
+          const merged = Array.from(map.values()).sort((a, b) => 
+            new Date(b.analyzed_at).getTime() - new Date(a.analyzed_at).getTime()
+          );
+          saveHistoryToStorage(merged);
+          return merged;
+        });
+      })
+      .catch(() => {});
 
     fetch(`${endpoint}/test-presets`)
       .then(r => r.ok ? r.json() : null)
@@ -447,9 +518,26 @@ export default function App() {
     setBusy(true);
     setError('');
     try {
+      const cached = getInvestigationFromStorage(id);
+      if (cached) {
+        setCurrent(cached);
+        setTab('summary');
+        setPage('investigations');
+        setMenu(false);
+        // Sync in background to server so endpoints remain warm
+        fetch(`${endpoint}/investigations/sync`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(cached)
+        }).catch(() => {});
+        return;
+      }
+
       const r = await fetch(`${endpoint}/investigations/${id}`);
       if (!r.ok) throw Error('Investigation could not be opened.');
-      setCurrent(await r.json());
+      const data: Investigation = await r.json();
+      saveInvestigationToStorage(data);
+      setCurrent(data);
       setTab('summary');
       setPage('investigations');
       setMenu(false);
@@ -498,18 +586,24 @@ export default function App() {
         throw Error(message);
       }
       const data: Investigation = await r.json();
+      saveInvestigationToStorage(data);
       setCurrent(data);
       setSelectedFinding(null);
       setQuery('');
       setHost(null);
-      setHistory(h => [{
-        id: data.id,
-        filename: data.filename,
-        analyzed_at: data.analyzed_at,
-        sha256: data.sha256,
-        packet_count: data.summary.packets_processed,
-        finding_count: data.findings.length
-      }, ...h]);
+      setHistory(h => {
+        const item: History = {
+          id: data.id,
+          filename: data.filename,
+          analyzed_at: data.analyzed_at,
+          sha256: data.sha256,
+          packet_count: data.summary.packets_processed,
+          finding_count: data.findings.length
+        };
+        const updated = [item, ...h.filter(x => x.id !== data.id)];
+        saveHistoryToStorage(updated);
+        return updated;
+      });
       setTab('summary');
       setPage('investigations');
       setFile(null);
@@ -547,18 +641,24 @@ export default function App() {
         throw Error(message);
       }
       const data: Investigation = await r.json();
+      saveInvestigationToStorage(data);
       setCurrent(data);
       setSelectedFinding(null);
       setQuery('');
       setHost(null);
-      setHistory(h => [{
-        id: data.id,
-        filename: data.filename,
-        analyzed_at: data.analyzed_at,
-        sha256: data.sha256,
-        packet_count: data.summary.packets_processed,
-        finding_count: data.findings.length
-      }, ...h]);
+      setHistory(h => {
+        const item: History = {
+          id: data.id,
+          filename: data.filename,
+          analyzed_at: data.analyzed_at,
+          sha256: data.sha256,
+          packet_count: data.summary.packets_processed,
+          finding_count: data.findings.length
+        };
+        const updated = [item, ...h.filter(x => x.id !== data.id)];
+        saveHistoryToStorage(updated);
+        return updated;
+      });
       setTab('summary');
       setPage('investigations');
       setNotice(`Loaded and executed test condition: ${data.filename}`);
@@ -629,18 +729,24 @@ export default function App() {
         throw Error(msg);
       }
       const data: Investigation = await r.json();
+      saveInvestigationToStorage(data);
       setCurrent(data);
       setSelectedFinding(null);
       setQuery('');
       setHost(null);
-      setHistory(h => [{
-        id: data.id,
-        filename: data.filename,
-        analyzed_at: data.analyzed_at,
-        sha256: data.sha256,
-        packet_count: data.summary.packets_processed,
-        finding_count: data.findings.length
-      }, ...h]);
+      setHistory(h => {
+        const item: History = {
+          id: data.id,
+          filename: data.filename,
+          analyzed_at: data.analyzed_at,
+          sha256: data.sha256,
+          packet_count: data.summary.packets_processed,
+          finding_count: data.findings.length
+        };
+        const updated = [item, ...h.filter(x => x.id !== data.id)];
+        saveHistoryToStorage(updated);
+        return updated;
+      });
       setTab('summary');
       setPage('investigations');
       setNotice(`Condition simulated & evaluated: ${data.filename}`);
@@ -656,7 +762,14 @@ export default function App() {
     setError('');
     try {
       const r = await fetch(`${endpoint}/investigations/${current.id}/${kind}`);
-      if (!r.ok) throw Error('Export could not be generated.');
+      if (!r.ok) {
+        if (kind === 'packets.csv') {
+          generateCsvClientSide(current);
+          setNotice('Packet CSV generated directly from investigation cache.');
+          return;
+        }
+        throw Error('Export could not be generated.');
+      }
       const blob = await r.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -666,7 +779,12 @@ export default function App() {
       setTimeout(() => URL.revokeObjectURL(url), 10000);
       setNotice(`${kind === 'report.pdf' ? 'PDF report' : 'Packet CSV'} generated.`);
     } catch (e) {
-      setError((e as Error).message);
+      if (kind === 'packets.csv') {
+        generateCsvClientSide(current);
+        setNotice('Packet CSV generated directly from investigation cache.');
+      } else {
+        setError((e as Error).message);
+      }
     }
   };
 
@@ -762,8 +880,8 @@ export default function App() {
         <div className="side-foot">
           <div className="side-foot-icon"><ShieldCheck size={19} /></div>
           <div>
-            <strong>Zero Data Leakage</strong>
-            <span>100% Local Inference</span>
+            <strong>Zero Raw Retention</strong>
+            <span>In-Memory Volatile Processing</span>
           </div>
         </div>
         <div className="sidebar-meta">NETTRACE PRO / V2.0</div>
@@ -1164,7 +1282,7 @@ export default function App() {
 
                         <div className="slider-row">
                           <label htmlFor="sim-packet-volume" className="slider-label">
-                            <span>Packet Volume: <b>{simCount} packets</b></span>
+                            <span>Outbound Probe Volume: <b>{simCount} probes</b> {simRespRatio > 0 && <small style={{ color: 'var(--text-dim)', fontSize: '0.85em' }}>(+{Math.round(simCount * simRespRatio)} simulated replies)</small>}</span>
                           </label>
                           <input
                             id="sim-packet-volume"
@@ -1175,11 +1293,11 @@ export default function App() {
                             value={simCount}
                             onChange={e => setSimCount(parseInt(e.target.value, 10))}
                             className="slider"
-                            aria-label="Packet Volume"
+                            aria-label="Outbound Probe Volume"
                             aria-valuemin={4}
                             aria-valuemax={300}
                             aria-valuenow={simCount}
-                            aria-valuetext={`${simCount} packets`}
+                            aria-valuetext={`${simCount} outbound probe packets`}
                           />
                         </div>
 

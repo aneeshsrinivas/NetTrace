@@ -110,6 +110,29 @@ def list_investigations():
 def detail(investigation_id: str):
     return get_investigation(investigation_id)
 
+@app.post("/api/investigations/sync", status_code=200)
+def sync_investigation(data: dict):
+    inv_id = data.get("id")
+    if not inv_id:
+        raise HTTPException(400, "Missing investigation ID")
+    summary = data.get("summary", {})
+    packets_processed = summary.get("packets_processed", len(data.get("packets", [])))
+    findings_count = len(data.get("findings", []))
+    with connect() as db:
+        db.execute(
+            "INSERT OR REPLACE INTO investigations VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                inv_id,
+                data.get("filename", "synced_capture.pcap"),
+                data.get("analyzed_at", ""),
+                data.get("sha256", ""),
+                packets_processed,
+                findings_count,
+                json.dumps(data),
+            ),
+        )
+    return {"status": "synced", "id": inv_id}
+
 @app.post("/api/investigations", status_code=201)
 def upload(file: UploadFile = File(...), port_scan: bool = Form(True), syn_heavy: bool = Form(True), repeated: bool = Form(True)):
     filename = Path(file.filename or "").name

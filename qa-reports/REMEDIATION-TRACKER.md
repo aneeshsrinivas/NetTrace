@@ -9,6 +9,10 @@
 | **B05** | Section 5 (B05), TC23 | Test Studio Accessible Form Labels (`frontend/src/App.tsx`) | Medium / P1 | **VERIFIED** | Verified Explicit Labels, IDs & ARIA Slider Attributes |
 | **B06** | Section 5 (B06), TC12 | Test Studio Slider Defaults & Step Quantization | Low / P2 | **VERIFIED** | Verified Step Synchronization (No Quantization Drift) |
 | **B07** | Section 5 (B07), TC13 | Upload File Card Type Descriptor (`frontend/src/App.tsx`) | Low / P2 | **VERIFIED** | Verified Accurate Descriptor for Non-PCAP Files |
+| **B08** | Retest High Defect | Investigation Archive Persistence & Cold-Start Retrieval | High / P0 | **VERIFIED** | Verified LocalStorage Cache, Sync Endpoint & Export Fallbacks |
+| **B09** | Retest Medium Defect | Conflicting Security Conclusions (Multi-Vector Attack Score) | Medium / P1 | **VERIFIED** | Reconciled Findings & ML Severity (Threat Score 88, CRITICAL) |
+| **B10** | Retest Medium Defect | Single-Packet DDoS SYN Flood False Positive | Medium / P1 | **VERIFIED** | Calibrated Domain Rules & Rate Calculation (BENIGN 0.95) |
+| **B11** | Retest Medium Defect | Sidebar Privacy Disclosures & Synthesizer Volume Label | Medium / P1 | **VERIFIED** | Accurate In-Memory Badges & Outbound Probe Volume Wording |
 
 ---
 
@@ -202,4 +206,93 @@
 - **Test execution result**: PASSED.
 - **Retest result**: Verified.
 - **Remaining risk**: None.
+- **Final status**: **VERIFIED**
+
+---
+
+### B08 — Archive Records Not Reliably Retrievable Across Serverless Invocations
+- **Bug ID**: B08
+- **Original audit reference**: Retest High Defect (Archive records disappear / 404 on refresh)
+- **Affected component**: `frontend/src/App.tsx`, `backend/main.py`
+- **Reproduction procedure**:
+  1. Complete multiple investigations. Archive lists entries.
+  2. Refresh the browser page or trigger new requests across different serverless AWS Lambda containers.
+  3. Ephemeral `/tmp/nettrace.sqlite3` is lost on container switch. Archive returns `[]` or opening record yields "Investigation could not be opened".
+- **Root cause**:
+  Serverless functions on Vercel are stateless and ephemeral; `/tmp` is scoped to a single container instance and wiped upon rotation.
+- **Severity**: High / P0
+- **Fix plan**:
+  1. Added browser `localStorage` persistent caching for full investigations and archive history.
+  2. On page load / refresh, archive immediately initializes from local storage and merges with server records.
+  3. Opening an investigation checks local storage first, rendering instantly with zero 404 risk.
+  4. Added `POST /api/investigations/sync` to repopulate backend container databases from client cache.
+  5. Added client-side fallback generation for CSV exports directly from cached packets.
+- **Files changed**:
+  - `frontend/src/App.tsx`
+  - `backend/main.py`
+- **Regression test**: `backend/tests/test_remediation.py::test_sync_investigation_endpoint`
+- **Test execution result**: PASSED.
+- **Final status**: **VERIFIED**
+
+---
+
+### B09 — Security Conclusions Conflict with Observed Evidence (Multi-Vector)
+- **Bug ID**: B09
+- **Original audit reference**: Retest Medium Defect (Multi-Vector reported as BENIGN / LOW with 1/100 threat score despite 4 heuristic findings)
+- **Affected component**: `backend/analyzer.py`, `backend/ml_engine.py`
+- **Reproduction procedure**:
+  Run Multi-Vector incident preset (32 packets, 4 heuristic findings including port reconnaissance and SYN-heavy activity). Overall header reported "BENIGN / LOW" and threat index 1/100.
+- **Root cause**:
+  `analyzer.py` directly assigned `summary["threat_score"]` and `summary["overall_severity"]` from `ml_analysis`, completely decoupled from heuristic detections. In `ml_engine.py`, when individual attack probabilities were split across classes (e.g. 0.45 port scan, 0.43 DDoS), confidence fell below 0.50, defaulting to BENIGN even though benign probability was only 0.02.
+- **Severity**: Medium / P1
+- **Fix plan**:
+  1. Reconciled heuristic findings with `ml_analysis` in `backend/analyzer.py`: captures with multiple critical heuristic findings elevate threat score to >= 75 and overall severity to HIGH or CRITICAL.
+  2. Calibrated multiclass threshold in `backend/ml_engine.py` so attacks are maintained when non-benign conviction dominates.
+- **Files changed**:
+  - `backend/analyzer.py`
+  - `backend/ml_engine.py`
+- **Regression test**: `backend/tests/test_remediation.py::test_multi_vector_threat_scoring_reconciled`
+- **Test execution result**: PASSED (Threat score 88, CRITICAL).
+- **Final status**: **VERIFIED**
+
+---
+
+### B10 — Single-Packet PCAP Misclassified as DDoS SYN Flood
+- **Bug ID**: B10
+- **Original audit reference**: Retest Medium Defect (1-packet SYN fixture classified as "DDOS SYN FLOOD" critical, 55% confidence with 100 pkts/s artifact)
+- **Affected component**: `backend/ml_engine.py`
+- **Reproduction procedure**:
+  Upload valid 94-byte single SYN packet PCAP. ML engine reported "DDOS SYN FLOOD" (55% confidence) citing "High-frequency packet transmission: 100 packets/sec".
+- **Root cause**:
+  For single-packet captures, duration was set to 0.01s default, yielding packet_rate = 1 / 0.01 = 100 pkts/s. Combined with 100% SYN flag ratio, the Random Forest model triggered DDoS.
+- **Severity**: Medium / P1
+- **Fix plan**:
+  1. In `extract_host_features`, set duration to 0.0s for <2 timestamps and calculate rate as `pkt_count` rather than 100 pkts/s.
+  2. Added domain rule guard: `packet_count < 5` cannot constitute automated attack flows and is classified as `BENIGN` (0.95 confidence).
+  3. Added guard on `packet_rate > 25.0` explanation to require `packet_count >= 5`.
+- **Files changed**:
+  - `backend/ml_engine.py`
+- **Regression test**: `backend/tests/test_remediation.py::test_one_packet_not_classified_as_ddos`
+- **Test execution result**: PASSED (BENIGN, 0.95 confidence, threat score 0).
+- **Final status**: **VERIFIED**
+
+---
+
+### B11 — Sidebar Privacy Claims and Volume Slider Wording
+- **Bug ID**: B11
+- **Original audit reference**: Retest Medium Defect (Sidebar "Zero Data Leakage / 100% Local Inference" and volume slider omitting reply counts)
+- **Affected component**: `frontend/src/App.tsx`
+- **Reproduction procedure**:
+  1. Sidebar displayed "Zero Data Leakage" and "100% Local Inference" despite capture upload transport.
+  2. Synthesizer volume slider displayed "Packet Volume: 15 packets" but generated 30 packets with responses enabled.
+- **Root cause**:
+  Legacy copy in sidebar footer badge; volume slider label described outbound probes without indicating response multiplier.
+- **Severity**: Medium / P1
+- **Fix plan**:
+  1. Updated sidebar badge to "Zero Raw Retention" and "In-Memory Volatile Processing".
+  2. Updated slider label to "Outbound Probe Volume: {simCount} probes" with explicit dynamic indicator for simulated server replies.
+- **Files changed**:
+  - `frontend/src/App.tsx`
+- **Regression test**: Verified in `frontend/dist` build.
+- **Test execution result**: PASSED.
 - **Final status**: **VERIFIED**

@@ -302,9 +302,9 @@ def extract_host_features(packets):
             continue
 
         timestamps = [p.get("time_value") for p in out_pkts if p.get("time_value") is not None]
-        dur = (max(timestamps) - min(timestamps)) if len(timestamps) >= 2 else 0.01
+        dur = (max(timestamps) - min(timestamps)) if len(timestamps) >= 2 else 0.0
         pkt_count = len(out_pkts)
-        rate = pkt_count / max(0.001, dur)
+        rate = (pkt_count / dur) if dur > 0 else float(pkt_count)
 
         dports = [p.get("destination_port") for p in out_pkts if p.get("destination_port") is not None]
         distinct_ports = len(set(dports)) if dports else 1
@@ -418,33 +418,41 @@ def classify_capture(packets):
 
         # Domain rule calibration based on intrusion detection standards
         stats = data["stats"]
-        if pred_class == "BRUTE_FORCE" and stats["duration_sec"] < 5.0:
+        prob_dict = {cls: round(float(p), 3) for cls, p in zip(classes, probs)}
+        benign_prob = prob_dict.get("BENIGN", 0.0)
+
+        if stats["packet_count"] < 5:
+            # Micro-captures / individual packets cannot substantiate automated attack flows
+            pred_class = "BENIGN"
+            confidence = 0.95
+        elif pred_class == "BRUTE_FORCE" and stats["duration_sec"] < 5.0:
             pred_class = "BENIGN"
             confidence = 0.95
         elif pred_class == "PORT_SCAN" and stats["distinct_dest_ports"] < 5:
             pred_class = "BENIGN"
             confidence = 0.95
-        elif pred_class == "DDOS_SYN_FLOOD" and stats["syn_ratio"] < 0.6:
+        elif pred_class == "DDOS_SYN_FLOOD" and (stats["syn_ratio"] < 0.6 or stats["packet_count"] < 15):
             pred_class = "BENIGN"
             confidence = 0.95
         elif confidence < 0.50:
-            pred_class = "BENIGN"
-            confidence = 0.90
-
-        prob_dict = {cls: round(float(p), 3) for cls, p in zip(classes, probs)}
-
-
+            # If benign probability is high or model is purely uncertain, default to BENIGN.
+            # Otherwise, if attacks collectively dominate and benign probability is low, maintain the leading attack class.
+            if benign_prob > 0.35:
+                pred_class = "BENIGN"
+                confidence = 0.90
+            else:
+                # Elevate confidence to reflect non-benign conviction
+                confidence = max(confidence, 0.70)
 
         # Explainability: top contributing factors
         explanations = []
-        stats = data["stats"]
         if stats["distinct_dest_ports"] >= 8:
             explanations.append(f"Targeted {stats['distinct_dest_ports']} distinct destination ports (High entropy: {stats['port_entropy']})")
         if stats["syn_ratio"] >= 0.7:
             explanations.append(f"Abnormally high SYN packet ratio: {stats['syn_ratio']*100:.0f}%")
         if stats["response_ratio"] <= 0.2 and stats["syn_ratio"] >= 0.5:
             explanations.append(f"Minimal server response observed: {stats['response_ratio']*100:.0f}% reply rate")
-        if stats["packet_rate"] > 25.0:
+        if stats["packet_rate"] > 25.0 and stats["packet_count"] >= 5:
             explanations.append(f"High-frequency packet transmission: {stats['packet_rate']} packets/sec")
         if stats["inter_arrival_std"] < 0.005 and stats["packet_count"] >= 10:
             explanations.append(f"Machine-clockwork inter-arrival periodicity (std: {stats['inter_arrival_std']:.4f}s)")

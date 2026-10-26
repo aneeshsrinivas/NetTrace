@@ -153,3 +153,69 @@ def test_valid_custom_simulation_workflows(client):
     assert resp.status_code == 201, resp.text
     data = resp.json()
     assert data['summary']['protocols'].get('ICMP', 0) > 0
+
+def test_one_packet_not_classified_as_ddos(client):
+    """Verify single-packet capture is NOT classified as DDOS SYN FLOOD and threat score is benign."""
+    pcap_bytes = make_one_syn_pcap()
+    response = client.post(
+        '/api/investigations',
+        files={'file': ('single-syn.pcap', pcap_bytes, 'application/octet-stream')}
+    )
+    assert response.status_code == 201
+    data = response.json()
+    # Overall summary must be Benign
+    assert "BENIGN" in data['summary']['overall_severity'].upper()
+    assert data['summary']['threat_score'] <= 20
+    # Host ML classification must not be DDOS_SYN_FLOOD
+    classifications = data['ml_analysis']['classifications']
+    assert len(classifications) == 1
+    assert classifications[0]['prediction'] == "BENIGN"
+    assert classifications[0]['threat_score'] <= 20
+
+def test_multi_vector_threat_scoring_reconciled(client):
+    """Verify Multi-Vector capture (with heuristic findings) is reconciled to HIGH/CRITICAL threat score."""
+    resp = client.post('/api/test-presets/05_multi_threat/run')
+    assert resp.status_code == 201
+    data = resp.json()
+    # Must reconcile 4 findings into elevated threat score
+    assert data['summary']['findings'] == 4
+    assert data['summary']['threat_score'] >= 75
+    assert data['summary']['overall_severity'] in ("CRITICAL", "HIGH")
+    assert data['ml_analysis']['overall_threat_score'] >= 75
+    assert data['ml_analysis']['overall_severity'] in ("CRITICAL", "HIGH")
+
+def test_sync_investigation_endpoint(client):
+    """Verify /api/investigations/sync upserts cached investigations and enables retrieval across serverless refreshes."""
+    fake_id = "test-sync-12345678"
+    sync_payload = {
+        "id": fake_id,
+        "filename": "cached-test.pcap",
+        "analyzed_at": "2026-10-26T20:00:00Z",
+        "sha256": "abc123456789def",
+        "summary": {
+            "packets_processed": 5,
+            "overall_severity": "LOW",
+            "threat_score": 10
+        },
+        "packets": [
+            {"index": 1, "source": "10.0.0.1", "destination": "10.0.0.2", "protocol": "TCP", "length": 64}
+        ],
+        "findings": []
+    }
+    sync_resp = client.post('/api/investigations/sync', json=sync_payload)
+    assert sync_resp.status_code == 200
+    assert sync_resp.json() == {"status": "synced", "id": fake_id}
+
+    # Verify detail retrieval
+    detail_resp = client.get(f'/api/investigations/{fake_id}')
+    assert detail_resp.status_code == 200
+    detail_data = detail_resp.json()
+    assert detail_data['id'] == fake_id
+    assert detail_data['filename'] == "cached-test.pcap"
+
+    # Verify in list
+    list_resp = client.get('/api/investigations')
+    assert list_resp.status_code == 200
+    ids = [item['id'] for item in list_resp.json()]
+    assert fake_id in ids
+
